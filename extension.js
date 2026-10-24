@@ -2,7 +2,8 @@
   "use strict";
 
   // ─────────────────────────────────────────────
-  // 보낸 이미지 관리 v1.0.1
+  // 보낸 이미지 관리 v1.0.2
+  // v1.0.2: 건너뜀·실패가 있으면 결과 알림과 상태 줄에 그 사유를 함께 표시.
   // v1.0.1: 큰 보기에서 첨부 data를 HTML 문자열에 끼워 넣던 것을 DOM 속성 대입으로(속성 탈출 차단).
   //         잠금 확인 읽기가 실패하면 내 표를 지우고 물러남. 같은 사진이 두 번 붙은 메시지에서 고른 자리를 정확히 고침.
   //         PATCH 직전 생성 중이면 최대 10초 대기, WebP는 인코딩 뒤 자리를 다시 읽고 바로 씀.
@@ -1420,7 +1421,7 @@
       toast("이미 작업 중입니다", "info");
       return;
     }
-    const run = { kind, total: entries.length, done: 0, changed: 0, kept: 0, skipped: 0, failed: 0, saved: 0, cancelled: false, note: null, lockToken: null, lockRenew: null, errors: [] };
+    const run = { kind, total: entries.length, done: 0, changed: 0, kept: 0, skipped: 0, failed: 0, saved: 0, cancelled: false, note: null, lockToken: null, lockRenew: null, errors: [], reasons: new Map() };
     const lockError = await claimRemoteLock(run);
     if (lockError) {
       toast(lockError, "error", 8000);
@@ -1455,7 +1456,9 @@
             run.failed += 1;
             log.error(kind, entry.key, error);
           }
-          run.errors.push(`${entry.msgNo ? `#${entry.msgNo}` : entry.messageId}: ${error?.message || error}`);
+          const reason = String(error?.message || error);
+          run.errors.push(`${entry.msgNo ? `#${entry.msgNo}` : entry.messageId}: ${reason}`);
+          run.reasons.set(reason, (run.reasons.get(reason) || 0) + 1);
         }
         run.done += 1;
         scheduleRender();
@@ -1476,8 +1479,9 @@
       exitSelection({ silent: true });
       scheduleRender();
       const head = kind === "delete" ? "삭제" : "WebP 변환";
-      const msg = `${head} ${run.changed}장${run.saved ? ` (−${fmtBytes(run.saved)})` : ""}${run.kept ? ` · 유지 ${run.kept}` : ""}${run.skipped ? ` · 건너뜀 ${run.skipped}` : ""}${run.failed ? ` · 실패 ${run.failed}` : ""}${run.cancelled ? " · 중지됨" : ""}`;
-      toast(msg, run.failed ? "error" : "success", run.failed ? 8000 : 5000);
+      const why = reasonText(run);
+      const msg = `${head} ${run.changed}장${run.saved ? ` (−${fmtBytes(run.saved)})` : ""}${run.kept ? ` · 유지 ${run.kept}` : ""}${run.skipped ? ` · 건너뜀 ${run.skipped}` : ""}${run.failed ? ` · 실패 ${run.failed}` : ""}${run.cancelled ? " · 중지됨" : ""}${why ? ` — ${why}` : ""}`;
+      toast(msg, run.failed || run.skipped ? "error" : "success", run.failed || run.skipped ? 9000 : 5000);
       if (run.errors.length) log.warn("작업 상세", run.errors);
     }
   }
@@ -2095,6 +2099,16 @@
     el.innerHTML = `<span class="sim-status__text">${esc(parts.join(" · "))}</span>${action}`;
   }
 
+  /** 건너뜀·실패 사유를 많은 순으로 요약한다(최대 2가지). */
+  function reasonText(j) {
+    if (!j.reasons || !j.reasons.size) return "";
+    return Array.from(j.reasons.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2)
+      .map(([r, n]) => (j.reasons.size > 1 ? `${r} ${n}장` : r))
+      .join(", ");
+  }
+
   function runSummary(j) {
     const head = j.kind === "delete" ? "삭제" : "변환";
     const bits = [`${head} ${j.changed}장`];
@@ -2103,7 +2117,8 @@
     if (j.skipped) bits.push(`건너뜀 ${j.skipped}`);
     if (j.failed) bits.push(`실패 ${j.failed}`);
     if (j.cancelled) bits.push("중지됨");
-    return `마지막 작업: ${bits.join(" · ")}`;
+    const why = reasonText(j);
+    return `마지막 작업: ${bits.join(" · ")}${why ? ` (${why})` : ""}`;
   }
 
   function scheduleRender({ statusOnly = false } = {}) {
