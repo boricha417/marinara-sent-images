@@ -2,7 +2,10 @@
   "use strict";
 
   // ─────────────────────────────────────────────
-  // 보낸 이미지 관리 v1.0.0
+  // 보낸 이미지 관리 v1.0.1
+  // v1.0.1: 큰 보기에서 첨부 data를 HTML 문자열에 끼워 넣던 것을 DOM 속성 대입으로(속성 탈출 차단).
+  //         잠금 확인 읽기가 실패하면 내 표를 지우고 물러남. 같은 사진이 두 번 붙은 메시지에서 고른 자리를 정확히 고침.
+  //         PATCH 직전 생성 중이면 최대 10초 대기, WebP는 인코딩 뒤 자리를 다시 읽고 바로 씀.
   //
   // v1.0.0: 2단계 — 선택한 사진 삭제(메시지·숨은 답변 버전의 같은 사진까지, 메시지 자체는 유지)와
   //         WebP 축소(품질·긴 변 상한, 표본 예상치, 결과가 더 크면 유지). 적용 직전 서버에서 다시 읽어 바뀐 사진은 건너뛰고,
@@ -1178,11 +1181,24 @@
         return `다른 탭이나 기기에서 작업 중입니다 (${age}초 전 갱신). 끊긴 작업이면 ${Math.max(0, Math.round(REMOTE_LOCK_STALE_MS / 1000) - age)}초 뒤 자동 해제되고, 상태 줄에서 바로 지울 수도 있습니다`;
       }
       await marinara.storage.patch({ runLock: { token, at: new Date().toISOString(), kind: run.kind } });
-      await sleep(700);
-      const check = await readRemoteLock();
-      if (!check || check.token !== token) return "다른 탭이나 기기에서 같은 순간에 작업을 시작해 이쪽이 물러났습니다. 잠시 뒤 다시 시도하세요";
-      run.lockToken = token;
+      // 표를 쓴 순간부터 이 탭은 자기 표를 알아봐야 한다. 아래 확인이 실패해도 다음 시도에서
+      // 자기 표를 남의 것으로 오해해 3분을 기다리지 않도록 먼저 기억해 둔다.
       rememberOwnToken(token);
+      await sleep(700);
+      let check;
+      try {
+        check = await readRemoteLock();
+      } catch (error) {
+        // 확인을 못 했으니 서버에 내 표가 남아 있을 수 있다. 지울 수 있으면 지우고 물러난다.
+        run.lockToken = token;
+        await releaseRemoteLock(run);
+        return `잠금을 확인하지 못했습니다 (${error.message})`;
+      }
+      if (!check || check.token !== token) {
+        rememberOwnToken(null);
+        return "다른 탭이나 기기에서 같은 순간에 작업을 시작해 이쪽이 물러났습니다. 잠시 뒤 다시 시도하세요";
+      }
+      run.lockToken = token;
       run.lockRenew = setInterval(async () => {
         try {
           const current = await readRemoteLock();
@@ -1285,20 +1301,25 @@
       }
       return swipes;
     };
-    const find = (holder) => {
+    // 같은 사진이 한 메시지에 두 번 붙어 있을 수 있다(지문이 같음). 스캔 때의 자리(idx)에 같은 지문이 있으면
+    // 그 자리를 쓰고, 아니면(앞의 첨부가 지워져 자리가 밀린 경우) 지문으로 다시 찾는다. 전에는 늘 첫 번째를 골라
+    // 두 번째 타일을 지워도 첫 번째가 지워졌다.
+    const find = (holder, preferIdx) => {
       const atts = parseExtra(holder.extra).attachments;
       const list = Array.isArray(atts) ? atts : [];
-      return { list, idx: list.findIndex((a) => fpOfAttachment(a) === entry.fp) };
+      const atPreferred = Number.isInteger(preferIdx) && preferIdx >= 0 && preferIdx < list.length && fpOfAttachment(list[preferIdx]) === entry.fp;
+      const idx = atPreferred ? preferIdx : list.findIndex((a) => fpOfAttachment(a) === entry.fp);
+      return { list, idx };
     };
     const targets = [];
     if (entry.swipeIndex === null || entry.swipeIndex === undefined) {
-      const { list, idx } = find(row);
+      const { list, idx } = find(row, entry.idx);
       if (idx < 0) throw new SkipError("사진이 메시지에서 바뀌었거나 지워졌습니다. 다시 읽어 주세요");
       targets.push({ swipeIndex: null, list, idx, att: list[idx] });
     } else {
       const sw = (await getSwipes()).find((x) => x && x.index === entry.swipeIndex);
       if (!sw) throw new SkipError("그 답변 버전이 사라졌습니다. 다시 읽어 주세요");
-      const { list, idx } = find(sw);
+      const { list, idx } = find(sw, entry.idx);
       if (idx < 0) throw new SkipError("사진이 그 버전에서 바뀌었거나 지워졌습니다. 다시 읽어 주세요");
       targets.push({ swipeIndex: entry.swipeIndex, list, idx, att: list[idx] });
     }
@@ -1306,7 +1327,7 @@
       if (targets.some((t) => t.swipeIndex === m.swipeIndex)) continue;
       const sw = (await getSwipes()).find((x) => x && x.index === m.swipeIndex);
       if (!sw) continue;
-      const { list, idx } = find(sw);
+      const { list, idx } = find(sw, m.idx);
       if (idx >= 0) targets.push({ swipeIndex: m.swipeIndex, list, idx, att: list[idx] });
     }
     return { row, targets };
@@ -1337,20 +1358,33 @@
         if (!holder) return false;
       }
       const atts = parseExtra(holder.extra).attachments;
-      if (!predicate(Array.isArray(atts) ? atts : [])) return false;
+      if (!predicate(Array.isArray(atts) ? atts : [], t)) return false;
     }
     return true;
   }
 
+  /**
+   * PATCH 직전에 부른다. 열린 방에서 생성 중이면 최대 10초 기다리고, 계속이면 이 장은 미룬다.
+   * 자리를 읽은 뒤 PATCH까지의 틈(특히 WebP 인코딩 시간)에 엔진이 첨부에 캡션을 써 넣으면
+   * 우리가 들고 있는 배열이 낡아 그것을 덮어쓰게 되기 때문이다.
+   */
+  async function ensureQuietBeforePatch(entry, run) {
+    if (entry.chatId !== readActiveChatId() || !chatIsGenerating()) return;
+    if (!(await waitForQuiet(run, 10_000))) throw new SkipError("생성 중이라 미룸");
+  }
+
   /** 한 장을 WebP로 교체. "kept"면 결과가 더 커서 그대로 둔 것. */
-  async function convertEntry(entry, options) {
+  async function convertEntry(entry, options, run) {
     if (/webp/i.test(entry.type)) throw new SkipError("이미 WebP");
-    const { targets } = await locateTargets(entry);
-    const enc = await encodeWebp(targets[0].att.data, options);
+    const first = await locateTargets(entry);
+    const enc = await encodeWebp(first.targets[0].att.data, options);
     if (enc.blob.size >= entry.bytes) return "kept";
     const dataUrl = await blobToDataUrl(enc.blob);
     const info = dataUrlInfo(dataUrl);
     const newFp = fingerprintOf(dataUrl, info.bytes);
+    await ensureQuietBeforePatch(entry, run);
+    // 인코딩에 걸린 시간 동안 메시지가 바뀌었을 수 있으니 자리를 한 번 더 새로 읽고 곧바로 쓴다.
+    const { targets } = await locateTargets(entry);
     await patchTargets(entry, targets, (list, idx) => list.map((a, i) => (i === idx ? { ...a, type: "image/webp", data: dataUrl } : a)));
     const ok = await verifyTargets(entry, targets, (list) => list.some((a) => fpOfAttachment(a) === newFp));
     if (!ok) throw new Error("교체 뒤 확인에서 새 사진을 찾지 못했습니다");
@@ -1364,10 +1398,14 @@
   }
 
   /** 한 장을 메시지(와 거울 사본)에서 뺀다. 메시지 자체는 지우지 않는다. */
-  async function deleteEntry(entry) {
+  async function deleteEntry(entry, run) {
     const { targets } = await locateTargets(entry);
+    // 같은 사진이 두 번 붙어 있으면 하나를 뺀 뒤에도 지문이 남으므로 "없어졌는지"가 아니라 "하나 줄었는지"로 확인한다.
+    const countOf = (list) => list.filter((a) => fpOfAttachment(a) === entry.fp).length;
+    const before = new Map(targets.map((t) => [t.swipeIndex, countOf(t.list)]));
+    await ensureQuietBeforePatch(entry, run);
     await patchTargets(entry, targets, (list, idx) => list.filter((_, i) => i !== idx));
-    const ok = await verifyTargets(entry, targets, (list) => !list.some((a) => fpOfAttachment(a) === entry.fp));
+    const ok = await verifyTargets(entry, targets, (list, t) => countOf(list) < (before.get(t.swipeIndex) ?? 1));
     if (!ok) throw new Error("삭제 뒤 확인에서 사진이 아직 남아 있습니다");
     const scan = state.scans.get(entry.chatId);
     if (scan) scan.items = scan.items.filter((e) => e !== entry);
@@ -1404,7 +1442,7 @@
               if (!(await waitForQuiet(run))) throw new SkipError("생성 중이라 미룸");
             } else throw new SkipError("생성 중이라 미룸");
           }
-          const r = kind === "delete" ? await deleteEntry(entry) : await convertEntry(entry, options);
+          const r = kind === "delete" ? await deleteEntry(entry, run) : await convertEntry(entry, options, run);
           if (r === "kept") run.kept += 1;
           else {
             run.changed += 1;
@@ -2408,13 +2446,22 @@
     lb.querySelector('[data-act="prev"]').disabled = i <= 0;
     lb.querySelector('[data-act="next"]').disabled = i < 0 || i >= list.length - 1;
     // 썸네일을 먼저 보여 주고 원본이 오면 바꾼다
-    stage.innerHTML = entry.thumb
-      ? `<img class="sim-lb__img sim-lb__img--thumb" src="${entry.thumb}" alt=""><div class="sim-lb__loading">원본 불러오는 중…</div>`
-      : '<div class="sim-lb__loading">원본 불러오는 중…</div>';
+    // 첨부 data는 메시지에서 온 문자열이라 HTML에 끼워 넣지 않고 DOM 속성으로만 넣는다.
+    const makeImg = (src, className) => {
+      const img = document.createElement("img");
+      img.className = className;
+      img.alt = "";
+      img.src = src;
+      return img;
+    };
+    const loadingEl = document.createElement("div");
+    loadingEl.className = "sim-lb__loading";
+    loadingEl.textContent = "원본 불러오는 중…";
+    stage.replaceChildren(...(entry.thumb ? [makeImg(entry.thumb, "sim-lb__img sim-lb__img--thumb")] : []), loadingEl);
     try {
       const { dataUrl } = await fetchOriginal(entry);
       if (!state.lightbox || state.lightbox.token !== token) return;
-      stage.innerHTML = `<img class="sim-lb__img" src="${dataUrl}" alt="">`;
+      stage.replaceChildren(makeImg(dataUrl, "sim-lb__img"));
     } catch (error) {
       if (!state.lightbox || state.lightbox.token !== token) return;
       const loading = stage.querySelector(".sim-lb__loading");
