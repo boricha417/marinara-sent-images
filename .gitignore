@@ -1,0 +1,6 @@
+# 작업 메모·압축본은 깃헙에 올리지 않음
+설계안.md
+*.zip
+*.bak
+.DS_Store
+Thumbs.db
